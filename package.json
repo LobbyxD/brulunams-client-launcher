@@ -1,0 +1,71 @@
+{
+  "name": "brulunams-launcher",
+  "version": "1.0.31",
+  "description": "Windows patching launcher for BrulunaMS v62.",
+  "main": "src/main.js",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "clean:dist": "node scripts/clean-build-output.js",
+    "dist:win": "npm run clean:dist && electron-builder --win --dir",
+    "dist:win:installer": "npm run clean:dist && electron-builder --win nsis",
+    "prepare:client": "node scripts/prepare-release-client.js",
+    "publish:client": "npm run prepare:client && node scripts/publisher.js --client \"C:\\Maplestory\\V62\\client\\Release-Version\\Ai-place-here\"",
+    "serve:patch": "node scripts/server.js --public \"C:\\Maplestory\\V62\\client\\Release-Version\\Ai-place-here\\.patch\\public\" --host 127.0.0.1 --port 1717"
+  },
+  "dependencies": {
+    "electron-updater": "^6.6.2"
+  },
+  "devDependencies": {
+    "electron": "^39.2.6",
+    "electron-builder": "^26.0.12"
+  },
+  "build": {
+    "appId": "com.brulunams.launcher",
+    "productName": "BrulunaMS Launcher",
+    "files": [
+      "src/**/*",
+      "assets/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "C:\\Maplestory\\V62\\client\\Release-Version\\Ai-place-here",
+        "to": "ClientSeed",
+        "filter": [
+          "BrulunaMS.exe",
+          "BrulunaMS.dll",
+          "BrulunaMS_Fullscreen.exe",
+          "BrulunaMS_Windowed.exe",
+          "config.ini"
+        ]
+      }
+    ],
+    "directories": {
+      "output": "dist"
+    },
+    "icon": "assets/icon.ico",
+    "publish": [
+      {
+        "provider": "generic",
+        "url": "http://46.117.116.14:1717/launcher"
+      }
+    ],
+    "win": {
+      "artifactName": "${productName} Setup ${version}.${ext}",
+      "verifyUpdateCodeSignature": false,
+      "requestedExecutionLevel": "requireAdministrator",
+      "target": [
+        "nsis"
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "BrulunaMS Launcher"
+    }
+  }
+}
