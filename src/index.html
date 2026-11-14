@@ -8,6 +8,7 @@
 </head>
 <body>
   <main class="launcher-frame">
+    <small id="launcherVersionLabel" class="launcher-version-label">v...</small>
     <header class="titlebar">
       <div class="brand">
         <img src="../assets/fit/icon.png" alt="BrulunaMS" onerror="this.style.display='none'">
@@ -25,12 +26,12 @@
     <section class="launcher-body">
       <aside class="sidebar">
         <nav class="nav-list">
-          <button class="nav-item nav-home active" type="button"><span class="nav-icon">⌂</span><span>HOME</span><i></i></button>
-          <button class="nav-item nav-news" type="button"><span class="nav-icon">▤</span><span>NEWS</span></button>
-          <button class="nav-item nav-events" type="button"><span class="nav-icon">✦</span><span>EVENTS</span></button>
-          <button class="nav-item nav-rankings" type="button"><span class="nav-icon">♛</span><span>RANKINGS</span></button>
-          <button class="nav-item nav-donate" type="button"><span class="nav-icon">♥</span><span>DONATE</span></button>
-          <button class="nav-item nav-discord" type="button"><span class="nav-icon">☊</span><span>DISCORD</span></button>
+          <button class="nav-item nav-home active" type="button" data-panel="home"><span class="nav-icon">⌂</span><span>HOME</span><i></i></button>
+          <button class="nav-item nav-news" type="button" data-scroll-panel="news"><span class="nav-icon">▤</span><span>NEWS</span></button>
+          <button class="nav-item nav-events" type="button" data-scroll-panel="events"><span class="nav-icon">✦</span><span>EVENTS</span></button>
+          <button class="nav-item nav-rankings" type="button" data-scroll-panel="rankings"><span class="nav-icon">♛</span><span>RANKINGS</span></button>
+          <button class="nav-item nav-donate" type="button" data-action="donate" aria-label="Donate"><span class="nav-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19 14c1.5-1.5 3-3.2 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.8 0-3 .5-4.5 2-1.5-1.5-2.7-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4 3 5.5l7 7Z"/></svg></span><span class="nav-label">Donate</span></button>
+          <button class="nav-item nav-discord" type="button" data-action="discord" aria-label="Discord"><span class="nav-icon"><svg viewBox="0 0 127.14 96.36" aria-hidden="true"><path d="M107.7 8.07A105.15 105.15 0 0 0 81.47 0a72.06 72.06 0 0 0-3.36 6.83 97.68 97.68 0 0 0-29.11 0A72.37 72.37 0 0 0 45.64 0 105.89 105.89 0 0 0 19.39 8.09C2.79 32.65-1.71 56.6.54 80.21A105.73 105.73 0 0 0 32.71 96.36a77.7 77.7 0 0 0 6.89-11.11 68.42 68.42 0 0 1-10.85-5.18c.91-.66 1.8-1.34 2.66-2.03a75.58 75.58 0 0 0 64.35 0c.87.71 1.76 1.39 2.66 2.03a68.68 68.68 0 0 1-10.87 5.19 77 77 0 0 0 6.89 11.1 105.25 105.25 0 0 0 32.19-16.14c2.64-27.38-4.51-51.11-18.93-72.15ZM42.45 65.69c-6.27 0-11.44-5.72-11.44-12.76s5.06-12.77 11.44-12.77c6.39 0 11.55 5.77 11.44 12.77 0 7.04-5.06 12.76-11.44 12.76Zm42.24 0c-6.27 0-11.44-5.72-11.44-12.76s5.05-12.77 11.44-12.77c6.39 0 11.55 5.77 11.44 12.77 0 7.04-5.05 12.76-11.44 12.76Z"/></svg></span><span class="nav-label">Discord</span></button>
         </nav>
 
         <section class="status-card">
@@ -63,6 +64,30 @@
             <p>JOIN THE ADVENTURE. WRITE YOUR LEGEND.</p>
           </div>
           <img class="character-art" src="../assets/fit/characters_hero_group.png" alt="" onerror="this.style.display='none'">
+          <section id="accountPanel" class="account-panel" aria-label="Website account">
+            <div class="account-content">
+              <div class="account-head"><h2>YOUR ACCOUNT</h2><button id="accountLogoutButton" type="button" hidden>Log out</button></div>
+              <form id="accountLoginForm" class="account-login-form">
+                <label>Email<input id="accountUsernameInput" type="email" autocomplete="username" required></label>
+                <label>Password<input id="accountPasswordInput" type="password" autocomplete="current-password" required></label>
+                <div class="account-options"><label class="account-remember"><input id="accountRememberInput" type="checkbox"><span class="remember-switch"><i></i></span><b>Remember email</b></label></div>
+                <button id="accountLoginButton" class="account-login-button" type="submit">LOG IN</button>
+                <div class="account-links"><button id="accountForgotButton" type="button">Forgot password?</button><button id="accountRegisterButton" type="button">Register</button></div>
+              </form>
+              <div id="accountPicker" class="account-picker" hidden><p id="accountWelcome"></p><p>Select the game account to launch.</p><div id="accountList" class="account-list"></div></div>
+              <p id="accountStatus" class="account-status" role="status"></p>
+            </div>
+          </section>
+          <section id="scrollDialog" class="scroll-dialog" hidden>
+            <span class="glass-shine"></span>
+            <span class="glass-ripple glass-ripple-one"></span>
+            <span class="glass-ripple glass-ripple-two"></span>
+            <div class="scroll-content">
+              <h2 id="scrollTitle">News</h2>
+              <p id="scrollBody">Latest announcements are being prepared.</p>
+              <div id="rankingsPodium" class="rankings-podium" hidden></div>
+            </div>
+          </section>
         </section>
 
         <div class="update-separator" aria-hidden="true">
@@ -121,10 +146,6 @@
             Resolution
             <select id="resolutionInput">
               <option value="800x600">800 x 600</option>
-              <option value="1024x768">1024 x 768</option>
-              <option value="1280x720">1280 x 720</option>
-              <option value="1366x768">1366 x 768</option>
-              <option value="1600x900">1600 x 900</option>
               <option value="1920x1080">1920 x 1080</option>
             </select>
           </label>
@@ -132,29 +153,10 @@
             <input id="borderlessInput" type="checkbox">
             <span>Borderless window</span>
           </label>
-          <label class="toggle-row">
-            <input id="scaleToScreenInput" type="checkbox">
-            <span>Scale to screen</span>
-          </label>
-          <label class="toggle-row">
-            <input id="mobOverlayInput" type="checkbox">
-            <span>Show mob levels</span>
-          </label>
-          <label class="toggle-row">
-            <input id="textShortcutsInput" type="checkbox">
-            <span>Text input shortcuts</span>
-          </label>
-          <label class="toggle-row">
-            <input id="spaceNpcInput" type="checkbox">
-            <span>Space advances NPC dialogs</span>
-          </label>
-          <label class="toggle-row">
-            <input id="autoFlashJumpInput" type="checkbox">
-            <span>Auto flash jump helper</span>
-          </label>
         </div>
         <p id="settingsPath"></p>
         <div class="settings-actions">
+          <button id="settingsOpenInstallButton" type="button">Open Install Directory</button>
           <button id="settingsCancelButton" type="button">Cancel</button>
           <button id="settingsSaveButton" type="button">Save</button>
         </div>

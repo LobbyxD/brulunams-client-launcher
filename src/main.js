@@ -1,20 +1,36 @@
-const { app, BrowserWindow, ipcMain, dialog, shell } = require("electron");
+const { createLoginEnvironment, validateTicketEndpoint } = require("./auto-login");
+const { app, BrowserWindow, ipcMain, nativeImage, shell } = require("electron");
 const { autoUpdater } = require("electron-updater");
 const childProcess = require("child_process");
 const crypto = require("crypto");
 const fs = require("fs");
 const fsp = require("fs/promises");
+const net = require("net");
 const path = require("path");
 const config = require("./config");
+
+const DISCORD_INVITE_URL = "https://discord.gg/yuaahEyjR8";
+const LAUNCHER_AUTO_LOGIN_ENABLED = true;
 
 let mainWindow;
 let currentProgress = null;
 let dragState = null;
 let launcherSelfUpdatePromise = null;
 let launcherSelfUpdateInstalling = false;
+let launcherAutoUpdaterConfigured = false;
+let launcherUpdateWindow = null;
+let launcherUpdateWindowReady = false;
+let pendingLauncherUpdateProgress = null;
 let selectedClientDir = null;
 let selectedClientDirReason = null;
 let activePatchBaseUrl = String(config.PUBLIC_PATCH_BASE_URL || "").replace(/\/+$/, "");
+let accountSession = {
+  token: null,
+  cookieHeader: "",
+  user: null,
+  accounts: [],
+  selectedAccountId: null
+};
 
 function appRoot() {
   return app.isPackaged ? path.dirname(process.execPath) : path.resolve(__dirname, "..");
@@ -27,19 +43,6 @@ function installedClientDir() {
 function bundledClientDir() {
   if (!app.isPackaged) return config.AUTHORITATIVE_CLIENT_DIR;
   return path.join(process.resourcesPath, "ClientSeed");
-}
-
-function canWriteClientDir(clientDir) {
-  try {
-    const launcherDir = path.join(clientDir, ".launcher");
-    fs.mkdirSync(launcherDir, { recursive: true });
-    const probePath = path.join(launcherDir, `write-probe-${process.pid}.tmp`);
-    fs.writeFileSync(probePath, "ok");
-    fs.rmSync(probePath, { force: true });
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 function launcherWritableRoot() {
@@ -59,18 +62,12 @@ function launcherWritableRoot() {
 }
 
 function portableClientDir() {
-  if (!app.isPackaged) return path.join(launcherWritableRoot(), "Client");
+  if (!app.isPackaged) return config.LOCAL_CLIENT_DIR;
   if (selectedClientDir) return selectedClientDir;
 
-  const installClientDir = installedClientDir();
-  if (canWriteClientDir(installClientDir)) {
-    selectedClientDir = installClientDir;
-    selectedClientDirReason = "installed client folder is writable";
-    return selectedClientDir;
-  }
-
-  selectedClientDir = path.join(launcherWritableRoot(), "Client");
-  selectedClientDirReason = "installed client folder is not writable";
+  const stableClientDir = path.join(launcherWritableRoot(), "Client");
+  selectedClientDir = stableClientDir;
+  selectedClientDirReason = "stable local app data client folder";
   return selectedClientDir;
 }
 
@@ -94,6 +91,33 @@ function patchBaseUrl() {
   return activePatchBaseUrl || String(config.PUBLIC_PATCH_BASE_URL || "").replace(/\/+$/, "");
 }
 
+function patchHostName() {
+  try {
+    return new URL(patchBaseUrl()).hostname;
+  } catch {
+    return "127.0.0.1";
+  }
+}
+
+function checkTcpPort(host, port, timeoutMs = config.LIVE_STATUS_TIMEOUT_MS || 1200) {
+  return new Promise((resolve) => {
+    const socket = new net.Socket();
+    let settled = false;
+    const finish = (ok) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve(ok);
+    };
+
+    socket.setTimeout(timeoutMs);
+    socket.once("connect", () => finish(true));
+    socket.once("error", () => finish(false));
+    socket.once("timeout", () => finish(false));
+    socket.connect(port, host);
+  });
+}
+
 async function canReachPatchBaseUrl(baseUrl, timeoutMs = 800) {
   if (!baseUrl) return false;
   const controller = new AbortController();
@@ -109,6 +133,293 @@ async function canReachPatchBaseUrl(baseUrl, timeoutMs = 800) {
   } finally {
     clearTimeout(timeout);
   }
+}
+
+async function fetchRankings() {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 6000);
+  try {
+    const response = await fetch(config.RANKINGS_API_URL, {
+      cache: "no-store",
+      signal: controller.signal
+    });
+    if (!response.ok) throw new Error(`Rankings HTTP ${response.status}`);
+    const payload = await response.json();
+    const rows = Array.isArray(payload?.data) ? payload.data : [];
+    const rankings = rows.slice(0, 3).map((row, index) => ({
+      rank: Number(row.rank) || index + 1,
+      name: String(row.name || "Unknown").slice(0, 24),
+      jobName: String(row.jobName || "Beginner").slice(0, 32),
+      level: Number(row.level) || 0,
+      avatarUrl: String(row.avatarUrl || "")
+        .replace(/([?&])resize=\d+/i, "$1resize=3")
+        .replace(/([?&])padding=\d+/i, "$1padding=0")
+    }));
+    return attachRankingAvatarSizes(rankings);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function firstString(...values) {
+  for (const value of values) {
+    if (typeof value === "string" && value.trim()) return value.trim();
+    if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  }
+  return "";
+}
+
+function normalizeAccount(row, index = 0) {
+  if (!row || typeof row !== "object") {
+    const value = firstString(row, `Account ${index + 1}`);
+    return { id: value || String(index + 1), name: value || `Account ${index + 1}`, meta: "" };
+  }
+
+  const id = firstString(row.id, row.accountId, row.account_id, row.gameAccountId, row.game_account_id, row.username, row.name, index + 1);
+  const name = firstString(row.name, row.username, row.login, row.accountName, row.account_name, `Account ${index + 1}`);
+  const meta = firstString(row.email, row.status, row.world, row.createdAt, row.created_at);
+  return { id, name, meta };
+}
+
+function extractToken(payload) {
+  return firstString(
+    payload?.token,
+    payload?.accessToken,
+    payload?.access_token,
+    payload?.sessionToken,
+    payload?.session_token,
+    payload?.data?.token,
+    payload?.data?.accessToken,
+    payload?.data?.access_token,
+    payload?.data?.sessionToken,
+    payload?.data?.session_token
+  );
+}
+
+function extractUser(payload, username) {
+  const user = payload?.user || payload?.account || payload?.data?.user || payload?.data?.account || {};
+  return {
+    name: firstString(user.displayName, user.display_name, user.name, user.username, username),
+    id: firstString(user.id, user.userId, user.user_id, user.accountId, user.account_id)
+  };
+}
+
+function extractAccounts(payload) {
+  const candidates = [
+    payload?.accounts,
+    payload?.gameAccounts,
+    payload?.game_accounts,
+    payload?.characters,
+    payload?.data,
+    payload?.data?.accounts,
+    payload?.data?.gameAccounts,
+    payload?.data?.game_accounts,
+    payload?.data?.characters,
+    payload?.user?.accounts,
+    payload?.account?.accounts
+  ];
+  const rows = candidates.find((candidate) => Array.isArray(candidate)) || [];
+  return rows.map(normalizeAccount).filter((account) => account.id && account.name);
+}
+
+function splitSetCookieHeader(header) {
+  if (!header) return [];
+  return String(header)
+    .split(/,(?=\s*[^;,=\s]+=[^;,]+)/)
+    .map((value) => value.trim())
+    .filter(Boolean);
+}
+
+function cookieHeaderFromResponse(response) {
+  const headers = response.headers;
+  const setCookies = typeof headers.getSetCookie === "function"
+    ? headers.getSetCookie()
+    : splitSetCookieHeader(headers.get("set-cookie"));
+  return setCookies
+    .map((cookie) => String(cookie).split(";")[0].trim())
+    .filter(Boolean)
+    .join("; ");
+}
+
+async function fetchAuthJson(url, options = {}) {
+  const { captureCookies, ...fetchOptions } = options;
+  const response = await fetch(url, {
+    cache: "no-store",
+    credentials: "include",
+    ...fetchOptions,
+    headers: {
+      Accept: "application/json",
+      ...(fetchOptions.body ? { "Content-Type": "application/json" } : {}),
+      ...(fetchOptions.headers || {})
+    }
+  });
+  if (typeof captureCookies === "function") {
+    captureCookies(cookieHeaderFromResponse(response));
+  }
+  const text = await response.text();
+  let payload = {};
+  if (text) {
+    try {
+      payload = JSON.parse(text);
+    } catch {
+      payload = { message: text };
+    }
+  }
+  if (!response.ok || payload?.success === false || payload?.ok === false) {
+    throw new Error(payload?.message || payload?.error || `HTTP ${response.status}`);
+  }
+  return payload;
+}
+
+function authHeaders(token, cookieHeader) {
+  return {
+    ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    ...(cookieHeader ? { Cookie: cookieHeader } : {})
+  };
+}
+
+function safeIniValue(value) {
+  return String(value || "").replace(/[\r\n]/g, "").trim();
+}
+
+async function loadAccountList(token, cookieHeader) {
+  if (!config.ACCOUNT_LIST_API_URL) return [];
+  const payload = await fetchAuthJson(config.ACCOUNT_LIST_API_URL, {
+    headers: authHeaders(token, cookieHeader)
+  });
+  return extractAccounts(payload);
+}
+
+function publicAccountSession() {
+  return {
+    loggedIn: Boolean(accountSession.token || accountSession.user),
+    user: accountSession.user,
+    accounts: accountSession.accounts,
+    selectedAccountId: accountSession.selectedAccountId,
+    selectedAccount: accountSession.accounts.find((account) => account.id === accountSession.selectedAccountId) || null
+  };
+}
+
+async function loginAccount(credentials) {
+  const username = String(credentials?.username || "").trim();
+  const password = String(credentials?.password || "");
+  if (!username || !password) throw new Error("Enter your username/email and password.");
+
+  let cookieHeader = "";
+  const loginBodies = [{ email: username, password }];
+  if (!username.includes("@")) {
+    loginBodies.push({ email: username, username, login: username, password });
+  }
+  let payload = null;
+  let lastError = null;
+  for (const body of loginBodies) {
+    try {
+      payload = await fetchAuthJson(config.LOGIN_API_URL, {
+        method: "POST",
+        captureCookies: (cookies) => {
+          cookieHeader = cookies;
+        },
+        body: JSON.stringify(body)
+      });
+      break;
+    } catch (error) {
+      lastError = error;
+      const raw = error?.message || String(error);
+      if (username.includes("@") || !/invalid.*email|email.*invalid|HTTP 400|Bad Request/i.test(raw)) {
+        break;
+      }
+    }
+  }
+  if (!payload) throw lastError || new Error("Login failed.");
+
+  const token = extractToken(payload);
+  let accounts = extractAccounts(payload);
+  if ((token || cookieHeader) && accounts.length === 0) {
+    try {
+      accounts = await loadAccountList(token, cookieHeader);
+    } catch (error) {
+      await logLine("account list load failed after login", { error: serializeError(error) });
+    }
+  }
+
+  accountSession = {
+    token,
+    cookieHeader,
+    user: extractUser(payload, username),
+    accounts,
+    selectedAccountId: accounts.length === 1 ? accounts[0].id : null
+  };
+  await logLine("launcher account login complete", {
+    user: accountSession.user?.name,
+    accountCount: accountSession.accounts.length,
+    selectedAccountId: accountSession.selectedAccountId
+  });
+  return publicAccountSession();
+}
+
+function selectLauncherAccount(accountId) {
+  const id = String(accountId || "");
+  const exists = accountSession.accounts.some((account) => account.id === id);
+  if (!exists) throw new Error("Choose one of your accounts before playing.");
+  accountSession.selectedAccountId = id;
+  return publicAccountSession();
+}
+
+function logoutAccount() {
+  accountSession = {
+    token: null,
+    cookieHeader: "",
+    user: null,
+    accounts: [],
+    selectedAccountId: null
+  };
+  return publicAccountSession();
+}
+
+function publicAuthError(error, attemptedLogin = "") {
+  const raw = error?.message || String(error);
+  if (/Invalid login credentials/i.test(raw)) {
+    return "Invalid username/email or password.";
+  }
+  if (/invalid.*email|email.*invalid/i.test(raw)) {
+    return "Invalid username/email or password.";
+  }
+  if (/ENOTFOUND|EAI_AGAIN|fetch failed|remote name could not be resolved|getaddrinfo/i.test(raw)) {
+    return "Login service is unreachable right now.";
+  }
+  if (/HTTP 404/i.test(raw)) {
+    return "Launcher login endpoint is not configured correctly.";
+  }
+  if (/HTTP 401|Invalid login credentials|Unauthorized/i.test(raw)) {
+    return "Invalid username/email or password.";
+  }
+  return raw.replace(/^Error:\s*/i, "") || "Login failed.";
+}
+
+async function getAvatarVisibleMetrics(avatarUrl) {
+  try {
+    const response = await fetch(avatarUrl, { cache: "no-store" });
+    if (!response.ok) return null;
+    const buffer = Buffer.from(await response.arrayBuffer());
+    const image = nativeImage.createFromBuffer(buffer);
+    return image.getSize();
+  } catch {
+    return null;
+  }
+}
+
+async function attachRankingAvatarSizes(rankings) {
+  const metrics = await Promise.all(rankings.map((ranking) => getAvatarVisibleMetrics(ranking.avatarUrl)));
+  const displayScale = 1.1;
+
+  return rankings.map((ranking, index) => {
+    const metric = metrics[index];
+    if (!metric?.width) return { ...ranking, avatarWidth: null };
+    return {
+      ...ranking,
+      avatarWidth: Math.round(metric.width * displayScale)
+    };
+  });
 }
 
 async function selectPatchBaseUrl() {
@@ -187,6 +498,247 @@ function emitProgress(progress) {
   mainWindow.webContents.send("launcher:progress", progress);
 }
 
+function launcherUpdateHtml() {
+  return `<!doctype html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <style>
+    html, body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      font-family: "Trebuchet MS", "Segoe UI", Arial, sans-serif;
+      color: #ffffff;
+      background: transparent;
+      user-select: none;
+    }
+    .frame {
+      position: relative;
+      box-sizing: border-box;
+      width: 100vw;
+      height: 100vh;
+      padding: 30px 34px;
+      overflow: hidden;
+      border: 1px solid rgba(220, 246, 255, 0.72);
+      border-radius: 24px;
+      background:
+        linear-gradient(135deg, rgba(255, 255, 255, 0.2), rgba(107, 205, 255, 0.1) 45%, rgba(28, 72, 172, 0.28)),
+        radial-gradient(circle at 18% 14%, rgba(255, 255, 255, 0.32), transparent 26%),
+        radial-gradient(circle at 85% 90%, rgba(83, 203, 255, 0.2), transparent 30%),
+        linear-gradient(145deg, rgba(34, 86, 185, 0.88), rgba(15, 39, 106, 0.92));
+      box-shadow:
+        inset 0 1px 0 rgba(255, 255, 255, 0.44),
+        inset 0 -22px 36px rgba(41, 111, 214, 0.14),
+        0 22px 54px rgba(0, 12, 42, 0.55);
+      backdrop-filter: blur(7px) saturate(1.18);
+    }
+    .frame::before,
+    .frame::after {
+      position: absolute;
+      content: "";
+      pointer-events: none;
+    }
+    .frame::before {
+      inset: 1px;
+      border-radius: 22px;
+      background:
+        linear-gradient(120deg, rgba(255, 255, 255, 0.24), transparent 34%, rgba(255, 255, 255, 0.1) 62%, transparent 80%),
+        linear-gradient(90deg, rgba(255, 255, 255, 0.08), rgba(72, 180, 255, 0.05));
+      mix-blend-mode: screen;
+    }
+    .frame::after {
+      left: -28%;
+      top: -28%;
+      width: 66%;
+      height: 150%;
+      background: linear-gradient(105deg, transparent 18%, rgba(255, 255, 255, 0.22), transparent 76%);
+      transform: rotate(14deg);
+      animation: update-sheen 3.8s ease-in-out infinite;
+    }
+    .caustic {
+      position: absolute;
+      width: 270px;
+      height: 92px;
+      border-radius: 999px;
+      background:
+        radial-gradient(ellipse at 24% 50%, rgba(255, 255, 255, 0.2), transparent 34%),
+        radial-gradient(ellipse at 58% 45%, rgba(160, 231, 255, 0.15), transparent 38%),
+        linear-gradient(92deg, transparent 8%, rgba(232, 252, 255, 0.13), transparent 78%);
+      filter: blur(0.7px);
+      mix-blend-mode: screen;
+      opacity: 0.25;
+      pointer-events: none;
+      animation: update-caustic 4.8s ease-in-out infinite;
+    }
+    .caustic.one {
+      left: -72px;
+      top: 38px;
+      --start-rotate: -13deg;
+      --end-rotate: 7deg;
+    }
+    .caustic.two {
+      right: -76px;
+      bottom: 22px;
+      --start-rotate: 18deg;
+      --end-rotate: -6deg;
+      animation-delay: 1.2s;
+    }
+    .content {
+      position: relative;
+      z-index: 2;
+    }
+    .title {
+      margin: 0 0 8px;
+      font-size: 24px;
+      font-weight: 900;
+      letter-spacing: 0.02em;
+      text-shadow: 0 2px 10px rgba(0, 20, 88, 0.62);
+    }
+    .detail {
+      min-height: 18px;
+      margin: 0 0 22px;
+      color: #d9efff;
+      font-size: 13px;
+      font-weight: 800;
+    }
+    .bar {
+      position: relative;
+      height: 18px;
+      overflow: hidden;
+      border: 1px solid rgba(224, 247, 255, 0.78);
+      border-radius: 999px;
+      background: rgba(6, 24, 72, 0.5);
+      box-shadow:
+        inset 0 2px 5px rgba(0, 0, 0, 0.28),
+        0 0 18px rgba(89, 208, 255, 0.12);
+    }
+    .fill {
+      width: 0%;
+      height: 100%;
+      border-radius: inherit;
+      background: linear-gradient(90deg, #62ddff, #3b8bff 55%, #9dd7ff);
+      box-shadow: 0 0 18px rgba(92, 210, 255, 0.68);
+      transition: width 140ms ease;
+    }
+    .percent {
+      margin-top: 12px;
+      color: #ffffff;
+      font-size: 18px;
+      font-weight: 900;
+      text-align: right;
+      text-shadow: 0 2px 7px rgba(0, 21, 84, 0.55);
+    }
+    @keyframes update-sheen {
+      0%, 45% { transform: translate3d(0, 0, 0) rotate(14deg); opacity: 0; }
+      58% { opacity: 0.48; }
+      100% { transform: translate3d(230%, 0, 0) rotate(14deg); opacity: 0; }
+    }
+    @keyframes update-caustic {
+      0%, 100% {
+        transform: translate3d(-10px, 0, 0) rotate(var(--start-rotate)) scaleX(0.9) scaleY(0.94);
+        opacity: 0.12;
+      }
+      50% {
+        transform: translate3d(18px, -7px, 0) rotate(var(--end-rotate)) scaleX(1.08) scaleY(1.04);
+        opacity: 0.28;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="frame">
+    <span class="caustic one"></span>
+    <span class="caustic two"></span>
+    <section class="content">
+      <h1 class="title">Launcher is updating</h1>
+      <p id="detail" class="detail">Preparing update...</p>
+      <div class="bar"><div id="fill" class="fill"></div></div>
+      <div id="percent" class="percent">0%</div>
+    </section>
+  </main>
+  <script>
+    window.setLauncherUpdateProgress = (progress) => {
+      const percent = Math.max(0, Math.min(100, Number(progress.percent || 0)));
+      document.getElementById("fill").style.width = percent + "%";
+      document.getElementById("percent").textContent = Math.round(percent) + "%";
+      document.getElementById("detail").textContent = progress.detail || "Updating launcher...";
+    };
+  </script>
+</body>
+</html>`;
+}
+
+async function showLauncherUpdateWindow() {
+  if (launcherUpdateWindow && !launcherUpdateWindow.isDestroyed()) {
+    launcherUpdateWindow.show();
+    launcherUpdateWindow.focus();
+    return;
+  }
+
+  launcherUpdateWindowReady = false;
+  launcherUpdateWindow = new BrowserWindow({
+    width: 430,
+    height: 190,
+    resizable: false,
+    maximizable: false,
+    minimizable: false,
+    frame: false,
+    transparent: true,
+    backgroundColor: "#00000000",
+    alwaysOnTop: true,
+    skipTaskbar: false,
+    title: "Launcher is updating",
+    icon: path.join(__dirname, "..", "assets", "icon.ico"),
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration: false
+    }
+  });
+
+  launcherUpdateWindow.on("closed", () => {
+    launcherUpdateWindow = null;
+    launcherUpdateWindowReady = false;
+  });
+  launcherUpdateWindow.webContents.once("did-finish-load", () => {
+    launcherUpdateWindowReady = true;
+    if (pendingLauncherUpdateProgress) {
+      setLauncherUpdateWindowProgress(pendingLauncherUpdateProgress);
+    }
+  });
+  await launcherUpdateWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(launcherUpdateHtml())}`);
+}
+
+function setLauncherUpdateWindowProgress(progress) {
+  pendingLauncherUpdateProgress = progress;
+  if (!launcherUpdateWindow || launcherUpdateWindow.isDestroyed() || !launcherUpdateWindowReady) return;
+  launcherUpdateWindow.webContents.executeJavaScript(
+    `window.setLauncherUpdateProgress(${JSON.stringify(progress)})`,
+    true
+  ).catch(() => {});
+}
+
+async function beginLauncherUpdateUi(detail = "Preparing launcher update...") {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.hide();
+  }
+  await showLauncherUpdateWindow();
+  setLauncherUpdateWindowProgress({ percent: 0, detail });
+}
+
+function updateLauncherUpdateProgress(progress) {
+  const total = progress.total || 0;
+  const downloaded = progress.downloaded || progress.transferred || 0;
+  const percent = Math.max(0, Math.min(100, progress.percent || (total ? (downloaded / total) * 100 : 0)));
+  const detail = progress.phase === "LauncherInstalling"
+    ? "Installing update silently..."
+    : total
+      ? `Downloading ${Math.round(percent)}%`
+      : "Downloading launcher update...";
+  setLauncherUpdateWindowProgress({ percent, detail });
+}
+
 function toUrl(urlOrPath) {
   if (/^https?:\/\//i.test(urlOrPath)) return urlOrPath;
   return `${patchBaseUrl()}${urlOrPath.startsWith("/") ? "" : "/"}${urlOrPath}`;
@@ -246,6 +798,26 @@ async function copyDirectory(sourceDir, targetDir) {
 }
 
 async function bootstrapClientDir() {
+  if (app.isPackaged) {
+    const stableClientDir = path.join(launcherWritableRoot(), "Client");
+    const installClientDir = installedClientDir();
+    const stableExe = path.join(stableClientDir, config.GAME_EXE_NAME);
+    const installExe = path.join(installClientDir, config.GAME_EXE_NAME);
+
+    if (!fs.existsSync(stableExe) && fs.existsSync(installExe)) {
+      emitStatus("Migrating client");
+      await fsp.mkdir(stableClientDir, { recursive: true });
+      await copyDirectory(installClientDir, stableClientDir);
+      const installedState = path.join(installClientDir, ".launcher", "installed.json");
+      if (fs.existsSync(installedState)) {
+        await fsp.mkdir(path.join(stableClientDir, ".launcher"), { recursive: true });
+        await fsp.copyFile(installedState, path.join(stableClientDir, ".launcher", "installed.json"));
+      }
+      selectedClientDir = stableClientDir;
+      selectedClientDirReason = "migrated client to stable local app data folder";
+    }
+  }
+
   const clientDir = portableClientDir();
   await logLine("selected client folder", {
     clientDir,
@@ -449,53 +1021,34 @@ async function getManifest(latest) {
 async function checkUpdates(forceFullVerify = false) {
   await bootstrapClientDir();
   emitStatus("Checking");
+  if (!app.isPackaged && config.DISABLE_CLIENT_PATCHING_IN_DEV) {
+    await logLine("client patching skipped in development", {
+      clientDir: portableClientDir(),
+      forceFullVerify
+    });
+    return {
+      ready: true,
+      latest: null,
+      manifest: { files: [] },
+      changed: [],
+      deletions: [],
+      totalBytes: 0,
+      clientDir: portableClientDir()
+    };
+  }
   const latest = await getLatest();
   const state = await readInstallState();
 
   if (!forceFullVerify && state && state.manifestSha256 === latest.manifestSha256) {
     const manifest = await getManifest(latest);
-    const criticalNames = new Set([
-      config.GAME_EXE_NAME.toLowerCase(),
-      "brulunams.dll",
-      "brulunams_windowed.exe",
-      "brulunams_fullscreen.exe",
-      "mapleclientmod.dll"
-    ]);
-    const manifestFiles = (manifest.files || [])
-      .map((file) => ({ ...file, path: normalizeManifestPath(file.path) }));
-    const changed = [];
-    let totalBytes = 0;
-
-    for (const file of manifestFiles) {
-      if (await shouldPreserveExistingFile(file.path, false)) {
-        continue;
-      }
-
-      const localPath = path.join(portableClientDir(), file.path);
-      let needsUpdate = true;
-      try {
-        const stat = await fsp.stat(localPath);
-        needsUpdate = stat.size !== file.size;
-        if (!needsUpdate && criticalNames.has(path.basename(file.path).toLowerCase())) {
-          needsUpdate = (await sha256File(localPath)) !== file.sha256;
-        }
-      } catch {
-        needsUpdate = true;
-      }
-
-      if (needsUpdate) {
-        changed.push(file);
-        totalBytes += file.size || 0;
-      }
-    }
 
     return {
-      ready: changed.length === 0,
+      ready: true,
       latest,
       manifest,
-      changed,
+      changed: [],
       deletions: [],
-      totalBytes,
+      totalBytes: 0,
       clientDir: portableClientDir()
     };
   }
@@ -543,19 +1096,139 @@ async function checkUpdates(forceFullVerify = false) {
   };
 }
 
-async function isGameRunning() {
-  const exeNames = [
+function gameExecutableNames() {
+  return [
     config.GAME_EXE_NAME,
     "BrulunaMS_Windowed.exe",
     "BrulunaMS_Fullscreen.exe"
   ];
-  return new Promise((resolve) => {
-    childProcess.execFile("tasklist.exe", ["/FO", "CSV"], { windowsHide: true }, (error, stdout) => {
-      if (error) return resolve(false);
-      const lower = stdout.toLowerCase();
-      resolve(exeNames.some((exeName) => lower.includes(`"${exeName.toLowerCase()}"`)));
-    });
+}
+
+function isSameOrInsidePath(candidatePath, rootPath) {
+  if (!candidatePath || !rootPath) return false;
+  const relativePath = path.relative(path.resolve(rootPath), path.resolve(candidatePath));
+  return relativePath === "" || (!!relativePath && !relativePath.startsWith("..") && !path.isAbsolute(relativePath));
+}
+
+function parseCsvLine(line) {
+  const values = [];
+  let current = "";
+  let quoted = false;
+
+  for (let i = 0; i < line.length; i += 1) {
+    const char = line[i];
+    if (char === "\"") {
+      if (quoted && line[i + 1] === "\"") {
+        current += "\"";
+        i += 1;
+      } else {
+        quoted = !quoted;
+      }
+      continue;
+    }
+
+    if (char === "," && !quoted) {
+      values.push(current);
+      current = "";
+      continue;
+    }
+
+    current += char;
+  }
+
+  values.push(current);
+  return values;
+}
+
+function uniqueRunningGameProcesses(processes) {
+  const seen = new Set();
+  return processes.filter((processInfo) => {
+    const key = String(processInfo.pid || `${processInfo.name}:${processInfo.executablePath || ""}`).toLowerCase();
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
   });
+}
+
+async function listRunningGameProcesses() {
+  const exeNames = gameExecutableNames();
+  const allowedNames = new Set(exeNames.map((exeName) => exeName.toLowerCase()));
+  const clientDir = portableClientDir();
+
+  if (process.platform === "win32") {
+    const command = [
+      "$ErrorActionPreference = 'SilentlyContinue';",
+      "Get-CimInstance Win32_Process |",
+      "Where-Object { @('BrulunaMS.exe','BrulunaMS_Windowed.exe','BrulunaMS_Fullscreen.exe') -contains $_.Name } |",
+      "Select-Object ProcessId,Name,ExecutablePath,CommandLine |",
+      "ConvertTo-Json -Compress"
+    ].join(" ");
+
+    try {
+      const stdout = await new Promise((resolve, reject) => {
+        childProcess.execFile("powershell.exe", [
+          "-NoProfile",
+          "-NonInteractive",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-Command",
+          command
+        ], { windowsHide: true, timeout: 5000 }, (error, output) => {
+          if (error) return reject(error);
+          resolve(output || "");
+        });
+      });
+
+      const trimmed = stdout.trim();
+      if (trimmed) {
+        const parsed = JSON.parse(trimmed);
+        const rows = Array.isArray(parsed) ? parsed : [parsed];
+        return uniqueRunningGameProcesses(rows
+          .map((row) => ({
+            pid: Number(row.ProcessId) || 0,
+            name: String(row.Name || ""),
+            executablePath: String(row.ExecutablePath || ""),
+            commandLine: String(row.CommandLine || "")
+          }))
+          .filter((row) => allowedNames.has(row.name.toLowerCase()))
+          .filter((row) => !row.executablePath || isSameOrInsidePath(row.executablePath, clientDir)));
+      }
+    } catch (error) {
+      await logLine("process check CIM failed", { error: serializeError(error) });
+    }
+
+    return new Promise((resolve) => {
+      childProcess.execFile("tasklist.exe", ["/FO", "CSV", "/NH"], { windowsHide: true }, (error, stdout) => {
+        if (error) return resolve([]);
+        const matches = String(stdout || "")
+          .split(/\r?\n/)
+          .map((line) => line.trim())
+          .filter(Boolean)
+          .map(parseCsvLine)
+          .filter((columns) => allowedNames.has(String(columns[0] || "").toLowerCase()))
+          .map((columns) => ({
+            name: columns[0],
+            pid: Number(columns[1]) || 0,
+            executablePath: "",
+            commandLine: ""
+          }));
+        resolve(uniqueRunningGameProcesses(matches));
+      });
+    });
+  }
+
+  return [];
+}
+
+async function isGameRunning() {
+  const matches = await listRunningGameProcesses();
+  return matches.length > 0;
+}
+
+function formatRunningGameProcesses(processes) {
+  return processes
+    .map((processInfo) => `${processInfo.name}${processInfo.pid ? ` PID ${processInfo.pid}` : ""}`)
+    .join(", ");
 }
 
 async function downloadFile(file, stagingRoot, downloadedStart, totalBytes) {
@@ -759,8 +1432,9 @@ async function cleanupLegacyClientJunk() {
 }
 
 async function applyUpdates(updateInfo) {
-  if (await isGameRunning()) {
-    throw new Error(`${config.GAME_EXE_NAME} is running. Close the game before patching.`);
+  const runningGameProcesses = await listRunningGameProcesses();
+  if (runningGameProcesses.length > 0) {
+    throw new Error(`${formatRunningGameProcesses(runningGameProcesses)} running. Close the game before patching.`);
   }
 
   await fsp.mkdir(launcherDataDir(), { recursive: true });
@@ -830,28 +1504,7 @@ async function ensureDefaultClientConfig() {
   const configPath = clientConfigPath();
   if (await pathExists(configPath)) return;
 
-  const defaultConfig = [
-    "[MapleClient]",
-    "ClientExe=BrulunaMS_Windowed.exe",
-    "Width=800",
-    "Height=600",
-    "Borderless=0",
-    "Windowed=1",
-    "ScaleToScreen=0",
-    "ServerHost=lobbyx3.serveminecraft.net",
-    "MobLevelNameOverlay=1",
-    "TextInputShortcuts=1",
-    "AutoFlashJump=1",
-    "NpcDialogSpaceNext=1",
-    "AutoFlashJumpJumpVk=18",
-    "AutoFlashJumpSkillScan=87",
-    "AutoFlashJumpWindowMs=450",
-    "AutoFlashJumpHoldMs=70",
-    "AutoFlashJumpDelayMs=20",
-    ""
-  ].join("\r\n");
-
-  await fsp.writeFile(configPath, defaultConfig);
+  await fsp.writeFile(configPath, buildClientConfig({}), "ascii");
 }
 
 function readIniValue(text, section, key) {
@@ -909,6 +1562,23 @@ function setIniValue(text, section, key, value) {
   return lines.join("\r\n");
 }
 
+function buildClientConfig(settings = {}) {
+  const width = Number(settings.width) || 1920;
+  const height = Number(settings.height) || 1080;
+  const borderless = settings.borderless ? "1" : "0";
+  const windowed = settings.windowed === undefined ? "0" : (settings.windowed ? "1" : "0");
+
+  return [
+    "[MapleClient]",
+    "ClientExe=BrulunaMS_Windowed.exe",
+    `Width=${width}`,
+    `Height=${height}`,
+    `Borderless=${borderless}`,
+    `Windowed=${windowed}`,
+    ""
+  ].join("\r\n");
+}
+
 async function listClientExecutables(root = portableClientDir(), current = portableClientDir(), results = []) {
   let entries;
   try {
@@ -938,8 +1608,8 @@ async function getLauncherSettings() {
 
   const text = await fsp.readFile(configPath, "utf8");
   const clientExe = readIniValue(text, "MapleClient", "ClientExe") || "BrulunaMS_Windowed.exe";
-  const width = Number(readIniValue(text, "MapleClient", "Width")) || 800;
-  const height = Number(readIniValue(text, "MapleClient", "Height")) || 600;
+  const width = Number(readIniValue(text, "MapleClient", "Width")) || 1920;
+  const height = Number(readIniValue(text, "MapleClient", "Height")) || 1080;
   const readBool = (key, fallback = false) => {
     const value = readIniValue(text, "MapleClient", key);
     if (!value) return fallback;
@@ -949,15 +1619,10 @@ async function getLauncherSettings() {
   return {
     clientDir: portableClientDir(),
     configPath,
-    displayMode: clientExe.toLowerCase().includes("fullscreen") ? "fullscreen" : "windowed",
+    displayMode: readBool("Windowed", false) ? "windowed" : "fullscreen",
     width,
     height,
-    borderless: readBool("Borderless"),
-    scaleToScreen: readBool("ScaleToScreen"),
-    mobLevelNameOverlay: readBool("MobLevelNameOverlay", true),
-    textInputShortcuts: readBool("TextInputShortcuts", true),
-    npcDialogSpaceNext: readBool("NpcDialogSpaceNext", true),
-    autoFlashJump: readBool("AutoFlashJump", true)
+    borderless: readBool("Borderless")
   };
 }
 
@@ -967,63 +1632,99 @@ async function saveLauncherSettings(settings) {
     throw new Error("Please install the client first before changing play settings.");
   }
 
-  const width = Number(settings?.width) || 800;
-  const height = Number(settings?.height) || 600;
-  const allowedResolutions = new Set(["800x600", "1024x768", "1280x720", "1366x768", "1600x900", "1920x1080"]);
+  const width = Number(settings?.width) || 1920;
+  const height = Number(settings?.height) || 1080;
+  const allowedResolutions = new Set(["800x600", "1920x1080"]);
   if (!allowedResolutions.has(`${width}x${height}`)) {
     throw new Error("Please choose one of the listed resolutions.");
   }
 
-  const clientExe = settings?.displayMode === "fullscreen" ? "BrulunaMS_Fullscreen.exe" : "BrulunaMS_Windowed.exe";
-  const boolValue = (value) => (value ? "1" : "0");
+  const text = buildClientConfig({
+    width,
+    height,
+    borderless: Boolean(settings?.borderless),
+    windowed: settings?.displayMode !== "fullscreen"
+  });
 
-  let text = await fsp.readFile(configPath, "utf8");
-  text = setIniValue(text, "MapleClient", "ClientExe", clientExe);
-  text = setIniValue(text, "MapleClient", "Windowed", settings?.displayMode === "fullscreen" ? "0" : "1");
-  text = setIniValue(text, "MapleClient", "Width", String(width));
-  text = setIniValue(text, "MapleClient", "Height", String(height));
-  text = setIniValue(text, "MapleClient", "Borderless", boolValue(settings?.borderless));
-  text = setIniValue(text, "MapleClient", "ScaleToScreen", boolValue(settings?.scaleToScreen));
-  text = setIniValue(text, "MapleClient", "MobLevelNameOverlay", boolValue(settings?.mobLevelNameOverlay));
-  text = setIniValue(text, "MapleClient", "TextInputShortcuts", boolValue(settings?.textInputShortcuts));
-  text = setIniValue(text, "MapleClient", "NpcDialogSpaceNext", boolValue(settings?.npcDialogSpaceNext));
-  text = setIniValue(text, "MapleClient", "AutoFlashJump", boolValue(settings?.autoFlashJump));
-
-  await fsp.writeFile(configPath, text);
+  await fsp.writeFile(configPath, text, "ascii");
   return getLauncherSettings();
 }
 
-async function launchGame() {
+async function requestLauncherLoginTicket() {
+  if (!config.LAUNCHER_LOGIN_TICKET_URL) {
+    throw new Error("Launcher auto-login ticket endpoint is not configured.");
+  }
+  const selected = accountSession.accounts.find((account) => account.id === accountSession.selectedAccountId);
+  if (!selected?.name) {
+    throw new Error("Select one of your accounts before pressing Play.");
+  }
+  if (!accountSession.cookieHeader) {
+    throw new Error("Please log in again before pressing Play.");
+  }
+
+  validateTicketEndpoint(config.LAUNCHER_LOGIN_TICKET_URL);
+  let payload;
+  try {
+    payload = await fetchAuthJson(config.LAUNCHER_LOGIN_TICKET_URL, {
+      method: "POST",
+      headers: {
+        Cookie: accountSession.cookieHeader
+      },
+      body: JSON.stringify({ account: selected.name })
+    });
+  } catch (error) {
+    if (/Could not create launcher login ticket\.?$/i.test(error?.message || "")) {
+      throw new Error("Login ticket server is still running old code. Restart the Login Server, then press Play again.");
+    }
+    throw error;
+  }
+  const ticket = firstString(payload?.ticket, payload?.data?.ticket);
+  const account = firstString(payload?.account, payload?.data?.account, selected.name);
+  if (!ticket || !account) {
+    throw new Error("Login ticket service returned an invalid response.");
+  }
+  return { account, ticket };
+}
+
+async function launchGame(loginTicket = null) {
   await ensureDefaultClientConfig();
-  const command = path.join(portableClientDir(), config.GAME_EXE_NAME);
+  const gameExeName = config.GAME_EXE_NAME;
+  const clientDir = portableClientDir();
+  const command = path.join(clientDir, gameExeName);
   if (!(await pathExists(command))) {
-    throw new Error(`${config.GAME_EXE_NAME} is missing from ${portableClientDir()}.`);
+    throw new Error(`${gameExeName} is missing from ${clientDir}.`);
   }
 
   emitStatus("Starting game");
-  if (config.GAME_LAUNCH_ARGS.length) {
-    await new Promise((resolve, reject) => {
-      const child = childProcess.spawn(command, config.GAME_LAUNCH_ARGS, {
-        cwd: portableClientDir(),
-        detached: true,
-        stdio: "ignore",
-        windowsHide: false
-      });
-
-      child.once("error", reject);
-      child.once("spawn", () => {
-        child.unref();
-        resolve();
-      });
+  await logLine("launching game executable", {
+    isPackaged: app.isPackaged,
+    clientDir,
+    gameExeName,
+    command,
+    args: config.GAME_LAUNCH_ARGS
+  });
+  await new Promise((resolve, reject) => {
+    const child = childProcess.spawn(command, config.GAME_LAUNCH_ARGS, {
+      cwd: clientDir,
+      env: createLoginEnvironment(process.env, loginTicket),
+      detached: true,
+      stdio: "ignore",
+      windowsHide: false
     });
-  } else {
-    const launchError = await shell.openPath(command);
-    if (launchError) throw new Error(launchError);
-  }
+
+    child.once("error", reject);
+    child.once("spawn", () => {
+      child.unref();
+      resolve();
+    });
+  });
   emitStatus("Game running");
 }
 
 async function play() {
+  if (LAUNCHER_AUTO_LOGIN_ENABLED && !accountSession.selectedAccountId) {
+    throw new Error("Select one of your accounts before pressing Play.");
+  }
   if (await ensureLauncherIsCurrent()) return { ok: true, launcherUpdate: true };
   const updateInfo = await checkUpdates();
   if (!updateInfo.ready) {
@@ -1031,7 +1732,12 @@ async function play() {
     await applyUpdates(updateInfo);
   }
   emitStatus("Client is ready");
-  await launchGame();
+  let loginTicket = null;
+  if (LAUNCHER_AUTO_LOGIN_ENABLED) {
+    emitStatus("Preparing auto-login");
+    loginTicket = await requestLauncherLoginTicket();
+  }
+  await launchGame(loginTicket);
   return { ok: true };
 }
 
@@ -1047,13 +1753,42 @@ async function repair() {
 }
 
 async function pingPatchServer() {
+  const host = patchHostName();
+  const checks = [];
+
   try {
     const response = await fetch(`${patchBaseUrl()}/health`, { cache: "no-store" });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    return { online: true };
+    checks.push({ name: "Patch", port: config.PATCH_PORT, online: true });
   } catch {
-    return { online: false };
+    checks.push({ name: "Patch", port: config.PATCH_PORT, online: false });
   }
+
+  const serviceChecks = await Promise.all(
+    (config.LIVE_STATUS_SERVICES || []).map(async (service) => ({
+      ...service,
+      online: await checkTcpPort(host, service.port)
+    }))
+  );
+  checks.push(...serviceChecks);
+
+  const requiredNames = new Set(
+    (config.LIVE_STATUS_REQUIRED_SERVICES || [])
+      .map((name) => String(name || "").trim().toLowerCase())
+      .filter(Boolean)
+  );
+  const requiredChecks = requiredNames.size
+    ? checks.filter((service) => requiredNames.has(String(service.name || "").toLowerCase()))
+    : checks.filter((service) => service.name !== "Patch");
+  const offline = checks.filter((service) => !service.online);
+  const requiredOffline = requiredChecks.filter((service) => !service.online);
+  return {
+    online: requiredChecks.length > 0 && requiredOffline.length === 0,
+    host,
+    services: checks,
+    offline: offline.map((service) => service.name),
+    requiredOffline: requiredOffline.map((service) => service.name)
+  };
 }
 
 function parseVersionParts(version) {
@@ -1077,11 +1812,71 @@ function isVersionNewer(latest, current) {
 }
 
 async function getLatestLauncherVersion() {
-  const response = await fetch(`${patchBaseUrl()}/launcher/latest.yml`, { cache: "no-store" });
+  const latestUrl = `${patchBaseUrl()}/launcher/latest.yml?ts=${Date.now()}`;
+  const response = await fetch(latestUrl, {
+    cache: "no-store",
+    headers: {
+      "Cache-Control": "no-cache",
+      Pragma: "no-cache"
+    }
+  });
   if (!response.ok) throw new Error(`HTTP ${response.status} for launcher latest.yml`);
   const text = await response.text();
   const match = text.match(/^version:\s*['"]?([^'"\r\n]+)['"]?/m);
   return match ? match[1].trim() : null;
+}
+
+function launcherUpdaterCacheCandidates() {
+  const candidates = [];
+  const localAppData = process.env.LOCALAPPDATA
+    || process.env.LocalAppData
+    || process.env.localappdata;
+  const updaterNames = [
+    "brulunams-launcher-updater",
+    "BrulunaMS Launcher-updater",
+    `${app.getName()}-updater`
+  ];
+
+  if (localAppData) {
+    for (const updaterName of updaterNames) {
+      candidates.push(path.join(localAppData, updaterName));
+    }
+  }
+
+  try {
+    const userDataParent = path.dirname(app.getPath("userData"));
+    for (const updaterName of updaterNames) {
+      candidates.push(path.join(userDataParent, updaterName));
+    }
+  } catch {
+    // Ignore unavailable userData paths during very early startup.
+  }
+
+  return [...new Set(candidates.map((candidate) => path.normalize(candidate)))];
+}
+
+async function clearLauncherUpdaterCache(latestVersion) {
+  const removed = [];
+  for (const candidate of launcherUpdaterCacheCandidates()) {
+    try {
+      await fsp.rm(candidate, { recursive: true, force: true });
+      removed.push(candidate);
+    } catch (error) {
+      await logLine("launcher updater cache cleanup failed", {
+        latestVersion,
+        path: candidate,
+        error: serializeError(error)
+      });
+    }
+  }
+
+  if (removed.length > 0) {
+    await logLine("launcher updater cache cleared", {
+      currentVersion: app.getVersion(),
+      latestVersion,
+      removed
+    });
+  }
 }
 
 async function ensureLauncherIsCurrent() {
@@ -1099,6 +1894,7 @@ async function installLauncherUpdate(latestVersion) {
   if (!launcherSelfUpdatePromise) {
     launcherSelfUpdatePromise = (async () => {
       launcherSelfUpdateInstalling = true;
+      await beginLauncherUpdateUi(`Preparing launcher ${latestVersion}...`);
       emitStatus("Updating launcher", `Downloading launcher ${latestVersion}`);
       emitProgress({ phase: "LauncherDownloading", downloaded: 0, total: 0, percent: 0 });
       await logLine("launcher self-update start", {
@@ -1106,9 +1902,14 @@ async function installLauncherUpdate(latestVersion) {
         latestVersion,
         feedUrl: `${patchBaseUrl()}/launcher`
       });
+      await clearLauncherUpdaterCache(latestVersion);
 
       autoUpdater.autoDownload = true;
       autoUpdater.autoInstallOnAppQuit = true;
+      autoUpdater.requestHeaders = {
+        "Cache-Control": "no-cache",
+        Pragma: "no-cache"
+      };
       autoUpdater.setFeedURL({
         provider: "generic",
         url: `${patchBaseUrl()}/launcher`
@@ -1121,12 +1922,13 @@ async function installLauncherUpdate(latestVersion) {
 
       emitStatus("Restarting launcher", "Installing launcher update");
       emitProgress({ phase: "LauncherInstalling", applied: 1, total: 1 });
+      updateLauncherUpdateProgress({ phase: "LauncherInstalling", percent: 100 });
       await logLine("launcher self-update installing", {
         currentVersion: app.getVersion(),
         latestVersion
       });
 
-      setTimeout(() => autoUpdater.quitAndInstall(false, true), 600);
+      setTimeout(() => autoUpdater.quitAndInstall(true, true), 600);
       return true;
     })().catch(async (error) => {
       launcherSelfUpdateInstalling = false;
@@ -1144,10 +1946,15 @@ async function installLauncherUpdate(latestVersion) {
 }
 
 function setupLauncherAutoUpdater() {
-  if (!app.isPackaged) return;
+  if (!app.isPackaged || launcherAutoUpdaterConfigured) return;
+  launcherAutoUpdaterConfigured = true;
 
   autoUpdater.autoDownload = true;
   autoUpdater.autoInstallOnAppQuit = true;
+  autoUpdater.requestHeaders = {
+    "Cache-Control": "no-cache",
+    Pragma: "no-cache"
+  };
   autoUpdater.setFeedURL({
     provider: "generic",
     url: `${patchBaseUrl()}/launcher`
@@ -1156,39 +1963,55 @@ function setupLauncherAutoUpdater() {
   autoUpdater.on("download-progress", (progress) => {
     const total = progress.total || 0;
     const downloaded = progress.transferred || 0;
-    emitProgress({
+    const launcherProgress = {
       phase: "LauncherDownloading",
       downloaded,
       total,
       percent: progress.percent || (total ? (downloaded / total) * 100 : 0)
-    });
+    };
+    emitProgress(launcherProgress);
+    updateLauncherUpdateProgress(launcherProgress);
   });
 
   autoUpdater.on("update-downloaded", async (info) => {
     if (launcherSelfUpdateInstalling) return;
     launcherSelfUpdateInstalling = true;
-    await dialog.showMessageBox(mainWindow, {
-      type: "info",
-      buttons: ["Restart now"],
-      defaultId: 0,
-      title: "Launcher update ready",
-      message: `Launcher version ${info.version} is ready to install.`,
-      detail: "The launcher will restart to finish updating before patching the client."
+    await beginLauncherUpdateUi(`Installing launcher ${info?.version || ""}...`);
+    emitStatus("Restarting launcher", "Installing launcher update");
+    emitProgress({ phase: "LauncherInstalling", applied: 1, total: 1 });
+    updateLauncherUpdateProgress({ phase: "LauncherInstalling", percent: 100 });
+    await logLine("launcher background update installing", {
+      currentVersion: app.getVersion(),
+      latestVersion: info?.version
     });
-
-    autoUpdater.quitAndInstall(false, true);
+    setTimeout(() => autoUpdater.quitAndInstall(true, true), 600);
   });
+}
 
-  setTimeout(() => autoUpdater.checkForUpdates().catch(() => {}), 3000);
-  setInterval(() => autoUpdater.checkForUpdates().catch(() => {}), 30 * 60 * 1000);
+function startLauncherAutoUpdateChecks() {
+  if (!app.isPackaged) return;
+
+  const runCheck = async () => {
+    try {
+      await ensureLauncherIsCurrent();
+    } catch (error) {
+      await logLine("launcher self-update check failed", {
+        currentVersion: app.getVersion(),
+        error: serializeError(error)
+      });
+    }
+  };
+
+  setTimeout(runCheck, 1200);
+  setInterval(runCheck, 30 * 60 * 1000);
 }
 
 async function createWindow() {
   mainWindow = new BrowserWindow({
-    width: 1500,
-    height: 810,
-    minWidth: 1180,
-    minHeight: 660,
+    width: 1280,
+    height: 720,
+    minWidth: 1280,
+    minHeight: 720,
     resizable: false,
     maximizable: false,
     title: config.GAME_NAME,
@@ -1215,7 +2038,9 @@ ipcMain.handle("launcher:getState", async () => ({
   logPath: launcherLogPath(),
   visibleLogPath: visibleLauncherLogPath(),
   launcherVersion: app.getVersion(),
+  statusPollMs: config.STATUS_POLL_MS,
   progress: currentProgress,
+  accountSession: publicAccountSession(),
   server: await pingPatchServer()
 }));
 
@@ -1223,8 +2048,42 @@ ipcMain.handle("launcher:check", async (_event, options = {}) => checkUpdates(Bo
 ipcMain.handle("launcher:repair", async () => repair());
 ipcMain.handle("launcher:play", async () => play());
 ipcMain.handle("launcher:ping", async () => pingPatchServer());
+ipcMain.handle("launcher:getRankings", async () => fetchRankings());
+ipcMain.handle("launcher:getAccountSession", async () => publicAccountSession());
+ipcMain.handle("launcher:loginAccount", async (_event, credentials) => {
+  try {
+    return { ok: true, session: await loginAccount(credentials) };
+  } catch (error) {
+    await logLine("launcher account login failed", { error: serializeError(error) });
+    return { ok: false, error: publicAuthError(error, credentials?.username) };
+  }
+});
+ipcMain.handle("launcher:selectAccount", async (_event, accountId) => selectLauncherAccount(accountId));
+ipcMain.handle("launcher:logoutAccount", async () => logoutAccount());
 ipcMain.handle("launcher:getSettings", async () => getLauncherSettings());
 ipcMain.handle("launcher:saveSettings", async (_event, settings) => saveLauncherSettings(settings));
+ipcMain.handle("launcher:openInstallDirectory", async () => {
+  const installDir = app.isPackaged ? path.dirname(app.getPath("exe")) : app.getAppPath();
+  const openError = await shell.openPath(installDir);
+  if (openError) throw new Error(openError);
+  return { ok: true, path: installDir };
+});
+ipcMain.handle("launcher:openDonate", async () => {
+  await shell.openExternal(config.DONATE_URL || DISCORD_INVITE_URL);
+  return { ok: true };
+});
+ipcMain.handle("launcher:openDiscord", async () => {
+  await shell.openExternal(DISCORD_INVITE_URL);
+  return { ok: true };
+});
+ipcMain.handle("launcher:openPasswordRecovery", async () => {
+  await shell.openExternal(config.PASSWORD_RECOVERY_URL);
+  return { ok: true };
+});
+ipcMain.handle("launcher:openRegister", async () => {
+  await shell.openExternal(config.REGISTER_URL);
+  return { ok: true };
+});
 ipcMain.handle("window:minimize", () => mainWindow?.minimize());
 ipcMain.handle("window:close", () => mainWindow?.close());
 ipcMain.handle("window:startDrag", (_event, point) => {
@@ -1261,6 +2120,7 @@ if (singleInstanceLock) {
     await selectPatchBaseUrl();
     await createWindow();
     setupLauncherAutoUpdater();
+    startLauncherAutoUpdateChecks();
   });
 }
 
